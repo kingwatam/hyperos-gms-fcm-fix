@@ -24,7 +24,7 @@ without changing anything until you pass a write switch.
 Installing or uninstalling an app, or changing a battery setting, drops the fix:
 PowerKeeper rebuilds the list from its own database. Reboots and app updates leave
 it in place. Nothing watches for it, so you find out when notifications stop
-arriving. See [Limits](#limits) for the rest.
+arriving. See [Limitations](#limitations) for the rest.
 
 ## Why
 
@@ -242,7 +242,7 @@ so a read-only run still changes nothing. It names the packages installed on
 your phone, so the repository ignores it. `-AllowEmptyList` overrides the stop
 for anyone whose list really is empty.
 
-## Limits
+## Limitations
 
 **A frozen Play services is not the only reason a notification does not arrive.**
 This is the part worth being straight about.
