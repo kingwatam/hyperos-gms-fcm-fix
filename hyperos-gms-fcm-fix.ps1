@@ -3,11 +3,22 @@
     Report and repair Xiaomi HyperOS freezing Google Play services.
 
 .DESCRIPTION
-    PowerKeeper publishes a list of apps exempt from freezing to
-    Settings.System MILLET_NO_RESTRICT_APP. Greezer checks that list before
-    freezing a process, and a frozen process cannot hold a socket open, so a
-    missing com.google.android.gms means the FCM connection drops whenever the
-    screen goes off.
+    HyperOS freezes Google Play services, and a frozen process cannot hold a
+    socket open, so push notifications stop arriving until something thaws it.
+    Two settings carry an exemption from that freeze and this script keeps both
+    of them correct:
+
+      MILLET_NO_RESTRICT_APP    the list Greezer checks before its quick-freeze
+                                and PowerStrategyMode paths. PowerKeeper owns
+                                it, rebuilds it from its own database, and
+                                drops entries this script adds.
+      com.miui.game.allowlist   a lower gate, checked by preCheckInterest, with
+                                no nighttime predicate. PowerKeeper does not
+                                manage it. Game predownload components do, and
+                                they rewrite the whole string.
+
+    Both hold package names for user 0, comma-separated and underscore-separated
+    respectively.
 
     Scope: official China ROM, HyperOS 3, Android 16 (API 36), Xiaomi / Redmi /
     POCO. Needs adb from Android SDK platform-tools on PATH and USB debugging
@@ -16,36 +27,40 @@
     USB debugging". Until you do, adb reports the phone as unauthorized.
 
     Read-only unless a write switch is passed. Writes are idempotent and keep
-    every list entry already present.
+    every list entry already present. A repair also saves the list it reads to a
+    file beside this script, so that a read landing in the middle of a
+    PowerKeeper rebuild cannot be mistaken for an empty list and overwrite the
+    rest of it.
 
     Typical sequence:
       1. no switch        see current state, change nothing
-      2. -Repair          add GMS to the list, disable the Greezer limiter
+      2. -Repair          exempt GMS at both gates, disable the Greezer limiter
       3. lock ~10 min, unlock
       4. -CheckFreeze      confirm GMS was not frozen while the screen was off
     Repeat step 2 when push starts lagging: PowerKeeper rebuilds the list from
     its own database and drops entries without warning.
 
-    -AddPackage and -RemovePackage use the same mechanism on any package.
-    That exempts an app from Greezer freezing only. It does not override MIUI
-    battery policy, AOSP Doze, or Aurogon broadcast control.
+    -AddPackage and -RemovePackage use the MILLET list on any package. That
+    exempts an app from Greezer freezing only. It does not override MIUI battery
+    policy, AOSP Doze, or Aurogon broadcast control.
 
     Findings: https://github.com/dingwen07/hyperos-fcm-fix
 
 .PARAMETER Repair
-    Add com.google.android.gms to the no-restrictions list if it is missing, and
-    run "dumpsys greezer IM GMS disable". Both steps are idempotent.
+    Put com.google.android.gms in both freeze exemption lists if it is missing,
+    run "dumpsys greezer IM GMS disable" and "dumpsys greezer LM add", then send
+    a thaw and a reconnect broadcast. All steps are idempotent.
 
 .PARAMETER CheckFreeze
     Count GMS freeze events logged since boot. Run after locking the phone for
     ten minutes and unlocking. Read-only.
 
 .PARAMETER AddPackage
-    Add packages to the no-restrictions list, e.g. -AddPackage com.whatsapp.
+    Add packages to MILLET_NO_RESTRICT_APP, e.g. -AddPackage com.whatsapp.
     Can be combined with -Repair.
 
 .PARAMETER RemovePackage
-    Remove packages from the no-restrictions list. Use to undo this tool.
+    Remove packages from MILLET_NO_RESTRICT_APP. Use to undo this tool.
 
 .PARAMETER ListCandidates
     List third-party packages that can be passed to -AddPackage, split into
@@ -66,6 +81,17 @@
 .PARAMETER KeepShellWrite
     Leave the WRITE_SETTINGS grant in place after a write operation. By default
     it is revoked, so the privilege exists only while a repair runs.
+
+.PARAMETER AllowEmptyList
+    Write to the list even when it reads back empty three times and no saved
+    copy exists. Without this a repair stops rather than risk replacing every
+    other entry. Only needed on a phone whose list really is empty.
+
+.PARAMETER Undo
+    Reverse a repair. Removes com.google.android.gms from both lists and
+    returns "dumpsys greezer IM GMS enable" to its factory value, which
+    -RemovePackage alone does not do. The Aurogon allowlist entry a repair adds
+    has no documented reverse verb; it is runtime-only and clears on reboot.
 
 .EXAMPLE
     .\hyperos-gms-fcm-fix.ps1
@@ -99,14 +125,26 @@ param(
     [int]$Seconds = 5,
     [string]$Serial,
     [switch]$KeepShellWrite,
+    [switch]$AllowEmptyList,
+    [switch]$Undo,
     [switch]$Help
 )
 
 if ($Help) { Get-Help $PSCommandPath -Detailed; exit }
 
 $SettingsKey = "MILLET_NO_RESTRICT_APP"
+# Second, independent freeze gate. Checked by GreezeManagerService.preCheckInterest
+# through AurogonImmobulusMode.isGameAllowListApp, below both the Aurogon quick-freeze
+# path and PowerStrategyMode that MILLET covers, and with no nighttime predicate.
+# PowerKeeper does not write it. SecurityCenter and Joyose do, for game predownload,
+# and they rewrite the whole string.
+$GameKey     = "com.miui.game.allowlist"
+# Java String.split("_"), so an underscore cannot appear in a package name and
+# trailing separators are dropped on read.
+$GameSep     = "_"
 $DefaultPkg  = "com.google.android.gms"
 $ProbeKey    = "hyperos_gms_fcm_fix_probe"
+$StateFile   = "hyperos-gms-fcm-fix.lastgood"
 $User        = 0
 
 # How to invoke this script here, for the hints it prints. $IsWindows is absent
@@ -115,6 +153,15 @@ $self = if ($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop') {
     ".\hyperos-gms-fcm-fix.ps1"
 } else {
     "./hyperos-gms-fcm-fix.ps1"
+}
+
+# Last known-good copy of the no-restrictions list. See Get-SafeEntries for why
+# this exists. Written only during a repair, so a read-only run still creates
+# nothing and the promise in the help text holds.
+$statePath = if ($PSScriptRoot) {
+    Join-Path $PSScriptRoot $StateFile
+} else {
+    Join-Path ([System.IO.Path]::GetTempPath()) $StateFile
 }
 
 function Head($t) { Write-Host "`n$t" -ForegroundColor Cyan }
@@ -150,10 +197,10 @@ function PkgList($values) {
         ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" })
 }
 
-# pm list packages -U is used rather than parsing "userId=" out of
-# dumpsys package. For com.google.android.gms that dump is about 2 MB of
-# Activity Resolver Table and the per-package block never reaches the client,
-# so the pattern matches nothing. pm returns the uid directly:
+# pm list packages -U returns the uid directly. Parsing "userId=" out of
+# dumpsys package does not work: for com.google.android.gms that dump is about
+# 2 MB of Activity Resolver Table and the per-package block never reaches the
+# client, so the pattern matches nothing.
 #   package:com.google.android.gms uid:<owner>,<clone profile>
 # The first uid is the owner; the rest are other profiles.
 function Get-PkgUid($pkg) {
@@ -169,6 +216,93 @@ function Get-Entries {
     $raw = Get-Setting $SettingsKey
     if (-not $raw -or $raw -eq "null") { return @() }
     @(($raw -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+}
+
+function Save-State($entries) {
+    if (-not $entries -or $entries.Count -eq 0) { return }
+    try { $entries | Set-Content -Path $statePath -Encoding utf8 } catch { }
+}
+
+function Read-State {
+    if (-not (Test-Path $statePath)) { return @() }
+    @(Get-Content $statePath -ErrorAction SilentlyContinue |
+        ForEach-Object { "$_".Trim() } | Where-Object { $_ -ne "" })
+}
+
+# The list read for writing is not trusted to be complete.
+#
+# PowerKeeper rebuilds the whole string from its own database, and the rebuild is
+# not atomic from the outside. A read that lands during one returns empty or
+# null. Appending GMS to that and writing it back replaces every other
+# no-restrictions package the user had with a single entry, silently.
+#
+# Three defences: retry, because most rebuilds finish inside a few hundred ms;
+# fall back to the last known-good copy; and refuse to write at all rather than
+# guess. A genuinely empty list is almost never what anyone wants, so this costs
+# nothing in practice and -AllowEmptyList is there for the rare case.
+function Get-SafeEntries {
+    for ($i = 0; $i -lt 3; $i++) {
+        $entries = Get-Entries
+        if ($entries.Count -gt 0) { return $entries }
+        if ($i -lt 2) { Start-Sleep -Milliseconds 400 }
+    }
+
+    $cached = Read-State
+    if ($cached.Count -gt 0) {
+        Warn "list read back empty three times. Using the saved copy ($($cached.Count) entries)."
+        Note "A read during a PowerKeeper rebuild can come back empty."
+        return $cached
+    }
+
+    if ($AllowEmptyList) {
+        Warn "list is empty and no saved copy exists. Writing anyway, as asked."
+        return @()
+    }
+
+    Bad "the list read back empty three times and there is no saved copy."
+    Note "PowerKeeper was probably rebuilding it. Nothing has been changed."
+    Note "Re-run in a moment. If it keeps happening, pass -AllowEmptyList"
+    Note "to write anyway, which will leave the list holding only what you add."
+    exit 1
+}
+
+# Writing an empty value needs the quotes to survive the trip. adb joins the
+# arguments and the device shell drops a trailing empty one, so
+# "put system KEY " arrives as "put system KEY" and is rejected. The write then
+# silently leaves the old value in place while the caller reports success, which
+# is how removing the last entry used to do nothing at all.
+function Set-Setting($key, $value) {
+    if ($value -eq "") {
+        Sh ('settings --user {0} put system {1} ''""''' -f $User, $key) | Out-Null
+    } else {
+        Sh "settings --user $User put system $key $value" | Out-Null
+    }
+}
+
+# Second freeze gate. Separate namespace, separate separator, separate owner, so
+# it needs its own parse and join rather than a shared helper.
+function Get-GameEntries {
+    $raw = Get-Setting $GameKey
+    if (-not $raw -or $raw -eq "null") { return @() }
+    @(($raw -split "_") | Where-Object { $_ -ne "" })
+}
+
+function Set-GameEntries($entries) {
+    Set-Setting $GameKey (($entries | Select-Object -Unique) -join $GameSep)
+    return Get-GameEntries
+}
+
+# The only thaw vector found that needs no permission and beats Greezer. The
+# receiver is exported with no receiver permission, and it thaws the target uid
+# before it looks at the option value, so -1 changes no MiPush membership.
+function Send-Thaw($pkg) {
+    Sh "am broadcast --user $User -a com.xiaomi.mipush.REFRESH_WHITE_LIST_ACTION -p android --es pkgName $pkg --ei option -1" | Out-Null
+}
+
+# Restoring an exemption does not thaw a process that is already frozen. Order
+# matters: thaw, then ask for the socket back.
+function Send-Reconnect($pkg) {
+    Sh "am broadcast --user $User -a com.google.android.intent.action.GCM_RECONNECT -p $pkg" | Out-Null
 }
 
 # Android 16 no longer grants com.android.shell WRITE_SETTINGS by default.
@@ -200,8 +334,7 @@ function Revoke-ShellWrite {
 # spaces, so a value containing ", " arrives as two arguments and settings
 # rejects it with "Bad arguments".
 function Set-Entries($entries) {
-    $joined = ($entries | Select-Object -Unique) -join ","
-    Sh "settings --user $User put system $SettingsKey $joined" | Out-Null
+    Set-Setting $SettingsKey (($entries | Select-Object -Unique) -join ",")
     return Get-Entries
 }
 
@@ -238,6 +371,7 @@ function Show-Candidates {
 
 function Show-Status {
     $entries = Get-Entries
+    if ($entries.Count -gt 0) { Save-State $entries }
 
     Head "NO-RESTRICTIONS LIST  ($($entries.Count) entries)"
     $entries | ForEach-Object { Note "    $_" }
@@ -246,6 +380,12 @@ function Show-Status {
     foreach ($p in (PkgList $AddPackage)) { if ($entries -notcontains $p) { $miss += $p } }
     if ($miss.Count -eq 0) { Ok "all target packages present" }
     else { Bad "missing: $($miss -join ', ')" }
+    if ($entries.Count -eq 0) {
+        Warn "list is empty. A repair will refuse to write over this unless"
+        Note "-AllowEmptyList is passed."
+    }
+
+    $game = Get-GameEntries
 
     # One dumpsys call feeds both readings, so a large output is fetched once.
     $greezer = Sh "dumpsys greezer"
@@ -254,33 +394,81 @@ function Show-Status {
     Row "Greezer GMS limiter" $(if ($mLimiter) { $mLimiter.Line.Trim() } else { "not reported by this build" })
 
     $uid = Get-GmsUid
-    $fz = @($greezer | Select-String -SimpleMatch "FZ uid = $uid ").Count
-    Row "GMS freeze events" "$fz (since boot)"
+    $fz  = @(Split-SinceBoot @($greezer | Select-String -SimpleMatch "FZ uid = $uid "))
+    Row "GMS freezes, this boot" "$($fz.Count)"
+    if ($fz.Count) {
+        # The count is cumulative for this boot, so it still includes freezes
+        # that happened before the current repair landed. Saying "run -Undo"
+        # to someone who just ran -Repair would be nonsense.
+        if ($entries -contains $DefaultPkg) {
+            Note "may predate the current repair. Lock the phone, then re-check."
+        } else {
+            Warn "GMS is not exempted. Run -Repair."
+        }
+    }
 
     $sock = @(Sh "cat /proc/net/tcp /proc/net/tcp6" | Select-String ":146[CDE]")
     if ($sock.Count) {
         if (@($sock | Where-Object { $_.Line -match "\s01\s" }).Count) { Ok "FCM socket established" }
         else { Warn "FCM port present but not established" }
     } else { Warn "no FCM socket (screen off, or GMS frozen)" }
+
+    Head "PREDOWNLOAD EXEMPTION  ($GameKey)"
+    if ($game.Count) { $game | ForEach-Object { Note "    $_" } }
+    else { Note "    (absent on this build)" }
+    if ($game -contains $DefaultPkg) { Ok "Play services exempt from the lower freeze gate" }
+    else { Bad "Play services missing from $GameKey" }
+}
+
+# Greezer's history is a file on the device, not a per-boot counter. It
+# survives a reboot and keeps accumulating, so a raw count is lifetime history
+# and not what "did it freeze since I last rebooted" means. /proc/uptime gives
+# how long the phone has been up; combined with the device clock that gives the
+# boot instant to filter against.
+function Get-BootTime {
+    $now = ShText "date +%s"
+    if ($now -notmatch '^\d+$') { return $null }
+    $up = ShText "cat /proc/uptime"
+    if ($up -notmatch '^([\d.]+)') { return $null }
+    return [long]$now - [long][double]$Matches[1]
+}
+
+function Split-SinceBoot($matches) {
+    $boot = Get-BootTime
+    if ($null -eq $boot) { return , $matches }
+    $cut = ([DateTimeOffset]::FromUnixTimeSeconds($boot)).DateTime
+    @($matches | Where-Object {
+        # Accepts Select-String MatchInfo or a plain line, so the same filter
+        # works whether the text came from a file or from a live adb call.
+        $line = if ($_ -is [string]) { $_ } else { $_.Line }
+        if ($line.Length -lt 19) { return $true }
+        $ts = [datetime]::MinValue
+        if ([datetime]::TryParse($line.Substring(0, 19), [ref]$ts)) { $ts -ge $cut }
+        else { $true }
+    })
 }
 
 function Show-FreezeCheck {
-    Head "FREEZE CHECK (since boot)"
+    Head "FREEZE CHECK"
     $uid = Get-GmsUid
     if (-not $uid) { Bad "GMS not found."; return }
 
     $f = Join-Path ([System.IO.Path]::GetTempPath()) "greezer_gms_check.txt"
     Sh-ToFile "dumpsys greezer" $f
-    $events = @(Select-String -Path $f -Pattern "FZ uid = $uid ")
-    $total  = @(Select-String -Path $f -Pattern "FZ uid")
+    $allEvents = @(Select-String -Path $f -Pattern "FZ uid")
 
-    Row "total freeze events"       $total.Count
-    Row "events for GMS (uid $uid)" $events.Count
+    $events = Split-SinceBoot @(Select-String -Path $f -Pattern "FZ uid = $uid ")
+    $total  = Split-SinceBoot $allEvents
+    $lifetime = @($allEvents | Where-Object { $_.Line -match "FZ uid = $uid " }).Count
+
+    Row "freezes, this boot (all packages)" $total.Count
+    Row "freezes, this boot (GMS)"          $events.Count
+    Row "freezes, lifetime (GMS)"           $lifetime
 
     if ($events.Count -eq 0) {
-        Ok "GMS was not frozen. The list entry is holding."
+        Ok "GMS has not been frozen since boot."
     } else {
-        Bad "GMS was frozen since boot:"
+        Bad "GMS was frozen this boot:"
         $events | Select-Object -Last 5 | ForEach-Object { Note "  $_" }
     }
 }
@@ -358,6 +546,7 @@ $add = @()
 if ($Repair) { $add += $DefaultPkg }
 $add += PkgList $AddPackage
 $remove = PkgList $RemovePackage
+if ($Undo) { $remove += $DefaultPkg }
 
 if ($add.Count -eq 0 -and $remove.Count -eq 0) {
     Show-Status
@@ -377,7 +566,8 @@ if (-not (Enable-ShellWrite)) {
 }
 Ok "shell can write Settings.System"
 
-$entries = Get-Entries
+$entries = Get-SafeEntries
+Save-State $entries
 
 foreach ($p in $remove) {
     if ($entries -contains $p) { $entries = $entries | Where-Object { $_ -ne $p }; Ok "removed $p" }
@@ -393,10 +583,28 @@ if (($add | Where-Object { $entries -notcontains $_ }).Count -gt 0) {
     Bad "write did not land for at least one package"
 } else {
     Ok "list written ($($entries.Count) entries)"
+    Save-State $entries
+}
+
+# Second gate. Only Play services is managed here: the key belongs to the game
+# predownload components, which rewrite the whole string, so it is not a list to
+# add arbitrary packages to.
+$game = Get-GameEntries
+if ($remove -contains $DefaultPkg) {
+    if ($game -contains $DefaultPkg) {
+        $game = Set-GameEntries @($game | Where-Object { $_ -ne $DefaultPkg })
+        Ok "Play services removed from $GameKey"
+    }
+} elseif ($Repair -and $game -notcontains $DefaultPkg) {
+    $game = Set-GameEntries ($game + $DefaultPkg)
+    if ($game -contains $DefaultPkg) { Ok "Play services added to $GameKey" }
+    else { Warn "write to $GameKey did not land (harmless, the list entry above still applies)" }
+} elseif ($Repair) {
+    Ok "Play services already in $GameKey"
 }
 
 # Volatile: resets on reboot. Greezer checks the list before this limiter acts,
-# so the entry above is the part that matters.
+# so the entries above are the part that matters.
 $limiter = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
     ForEach-Object { $_.ToString().Trim() }
 if ($limiter -notmatch "false") {
@@ -406,6 +614,33 @@ if ($limiter -notmatch "false") {
     if ($now -match "false") { Ok "Greezer GMS limiter disabled" }
     else { Warn "limiter not available on this build (harmless)" }
 } else { Ok "Greezer GMS limiter already disabled" }
+
+# Restores GMS to the ordinary Aurogon allowlist, which triggerGMSLimitAction
+# removes it from. Does not cover PowerStrategyMode, so this is the third
+# layer rather than a replacement for the list.
+Sh "dumpsys greezer LM add $DefaultPkg" | Out-Null
+
+foreach ($p in $add) {
+    Send-Thaw $p
+    Send-Reconnect $p
+}
+if ($add.Count) { Ok "thaw and reconnect broadcast sent" }
+
+# -Undo also has to put the Greezer limiter back, which -RemovePackage on its own
+# would leave disabled. That flag is the most intrusive thing -Repair changes,
+# so leaving it flipped after an undo would be the worst version of this bug.
+# The "dumpsys greezer LM add" allowlist entry has no documented reverse verb
+# and is runtime-only, so it clears on the next reboot and nothing more is
+# attempted here.
+if ($Undo) {
+    Sh "dumpsys greezer IM GMS enable" | Out-Null
+    $back = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
+        ForEach-Object { $_.ToString().Trim() }
+    if ($back -notmatch "false") { Ok "Greezer GMS limiter returned to its factory value" }
+    else { Warn "could not re-enable the limiter; run 'dumpsys greezer IM GMS enable' by hand" }
+    Note "The Aurogon allowlist entry added by a repair has no reverse verb."
+    Note "It is runtime-only and clears on the next reboot."
+}
 
 Show-Status
 
