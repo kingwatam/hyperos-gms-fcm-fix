@@ -21,6 +21,11 @@ Targets official China ROM, HyperOS 3, Android 16 (API 36), on Xiaomi, Redmi and
 POCO devices. It is a script you run from your own PC, and it reads state
 without changing anything until you pass a write switch.
 
+Installing or uninstalling an app, or changing a battery setting, drops the fix:
+PowerKeeper rebuilds the list from its own database. Reboots and app updates leave
+it in place. Nothing watches for it, so you find out when notifications stop
+arriving. See [Limits](#limits) for the rest.
+
 ## Why
 
 HyperOS freezes background apps to save power, and a frozen process cannot hold
