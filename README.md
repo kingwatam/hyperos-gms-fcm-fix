@@ -277,16 +277,34 @@ services was frozen twice within minutes. `com.android.vending` survived the sam
 rebuild, because it is present in PowerKeeper's database. Only shell-added entries
 are lost.
 
-The same rebuild is triggered by:
+Uninstalling an app did the same, nine entries to eight again. Updating one did not.
+A Play Store update went through the full replace path and left the entry in place,
+with the freeze counters unchanged.
 
-- changing an app's Battery saver setting in the HyperOS UI
-- installing or removing an app
-- first launch of an app, which can promote a policy row
-- boot reconciliation, which can also happen after an OTA
+The rebuild is a write to PowerKeeper's own policy row. What decides it is whether
+that row changes:
 
-So run `-Repair` after installing anything or changing battery settings. The
-list survives reboots on its own, which is verified, but nothing watches for
-the entry disappearing, so you find out when notifications stop arriving.
+Measured on one device on one build. Package handling can differ on another
+build, so check it on yours.
+
+| Action | Effect on the entry | Basis |
+|---|---|---|
+| Installing an app | drops it | measured |
+| Uninstalling an app | drops it | measured |
+| Changing an app's Battery saver setting | drops it | measured |
+| Updating an app | survives | measured, one update |
+| Reboot | survives | measured |
+| First launch of an app, which can promote a policy row | drops it | from the code |
+| OTA | unknown | not tested |
+
+Updates are the one worth explaining, because Play Store updates are routine and
+the platform does broadcast `PACKAGE_ADDED` for them as well as for an install.
+PowerKeeper's manifest does not listen for it. Nothing writes the row, so no
+rebuild follows.
+
+So run `-Repair` after installing or removing anything, or after changing a
+battery setting. Updates and reboots leave it alone. Nothing watches for the
+entry disappearing, so you find out when notifications stop arriving.
 
 `com.miui.game.allowlist` is not managed by PowerKeeper, so it does not get
 dropped the same way. Two components do rewrite it, SecurityCenter and Joyose,
