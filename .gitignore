@@ -1,4 +1,14 @@
-# Written by -Repair: the last known-good copy of the no-restrictions list.
+# Written by -Repair: the last-known-good copy of the no-restrictions list.
 # It names the packages installed on the phone it ran against, so it stays out
 # of the repository.
 hyperos-gms-fcm-fix.lastgood
+
+# Investigation notes, held back for now. Untracked with "git rm --cached docs"
+# so they remain on disk and keep working locally.
+#
+# To publish them later:
+#   git rm --cached docs
+#   delete the two lines below
+#   git commit -m "Publish the investigation."
+#   git push
+docs/
