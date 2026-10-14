@@ -21,10 +21,11 @@ Targets official China ROM, HyperOS 3, Android 16 (API 36), on Xiaomi, Redmi and
 POCO devices. It is a script you run from your own PC, and it reads state
 without changing anything until you pass a write switch.
 
-Installing or uninstalling an app, or changing a battery setting, drops the fix:
-PowerKeeper rebuilds the list from its own database. Reboots and app updates leave
-it in place. Nothing watches for it, so you find out when notifications stop
-arriving. See [Limitations](#limitations) for the rest.
+Installing or uninstalling an app, or changing a battery setting, drops the
+no-restrictions entry, because PowerKeeper rebuilds that list from its own
+database. The predownload gate below is not rebuilt and survives it. Reboots and
+app updates leave both alone. Nothing watches for the entry disappearing, so you
+find out when notifications stop arriving. See [Limitations](#limitations).
 
 ## Why
 
@@ -40,6 +41,14 @@ itself for any package without a launcher icon, and Play services is one of them
   `PowerStrategyMode` paths
 - `com.miui.game.allowlist`, a lower gate checked before any freeze is applied,
   with no nighttime restriction
+
+The second of those is the one doing the work. With the first entry absent and the
+second present, Play services logged no freeze events at all across the 38 hours
+after the entry was dropped, while Greezer logged about 1,500 freeze events for
+other packages over the same span. An earlier short test gave the opposite result,
+eight events in six minutes with only the second gate populated, but the Greezer
+limiter was in an unusual state during it, which is why it needed repeating. Whether
+the first entry works on its own is untested.
 
 Symptoms:
 
@@ -292,7 +301,7 @@ that row changes:
 Measured on one device on one build. Package handling can differ on another
 build, so check it on yours.
 
-| Action | Effect on the entry | Basis |
+| Action | Effect on the no-restrictions entry | Basis |
 |---|---|---|
 | Installing an app | drops it | measured |
 | Uninstalling an app | drops it | measured |
@@ -308,8 +317,9 @@ PowerKeeper's manifest does not listen for it. Nothing writes the row, so no
 rebuild follows.
 
 So run `-Repair` after installing or removing anything, or after changing a
-battery setting. Updates and reboots leave it alone. Nothing watches for the
-entry disappearing, so you find out when notifications stop arriving.
+battery setting, to put the projection entry back. You may not need to. The
+predownload gate survives the same events, and on this build it held Play services
+unfrozen for 38 hours on its own.
 
 `com.miui.game.allowlist` is not managed by PowerKeeper, so it does not get
 dropped the same way. Two components do rewrite it, SecurityCenter and Joyose,
@@ -343,12 +353,16 @@ You get unattended repair across reboots, and a background app gains system
 settings access. This script trades that for having to notice when the fix lapses
 and re-run it yourself.
 
-An app using only `WRITE_SETTINGS` does not work here. `SettingsProvider`
-refuses writes to OEM-added keys from any app with a modern target SDK, so the
-write throws rather than failing quietly. Shell is exempt from that check, which
-is the route every working implementation takes. Aiming below target SDK 22 gets
-past the write, and Android 14 and later refuse to install such an app, so those
-two requirements cannot both be met.
+An app using only `WRITE_SETTINGS` has to aim below target SDK 22, because
+`SettingsProvider` refuses writes to OEM-added keys from any app with a modern
+target SDK and the write throws rather than failing quietly. Android 14 and later
+refuse such an app by default, but the installer accepts
+`adb install --bypass-low-target-sdk-block`, confirmed on this build, so both
+requirements can be met with one command on a tethered PC.
+[ReedGAOOO/FCMGuard-HyperOS](https://github.com/ReedGAOOO/FCMGuard-HyperOS) takes
+that route: open source, no `INTERNET` permission, and shipped as a debug-signed
+build. It watches the no-restrictions entry only, so on this build it covers one
+of the two gates.
 
 ## Credits
 
