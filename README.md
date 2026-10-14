@@ -8,11 +8,11 @@ Diagnose and repair Xiaomi HyperOS freezing Google Play services, from PowerShel
 
 No root. No unlocked bootloader. No Shizuku. No APK on the phone.
 
-| Approach | Root | Unlocked bootloader | Shizuku | APK on phone |
+| Approach | No root | No unlocked bootloader | No Shizuku | No APK on phone |
 |---|:---:|:---:|:---:|:---:|
-| This script | ❌ | ❌ | ❌ | ❌ |
-| App using Shizuku | ❌ | ❌ | ✅ | ✅ |
-| Root via Magisk | ✅ | ✅ | ❌ | ❌ |
+| This script | ✅ | ✅ | ✅ | ✅ |
+| App using Shizuku | ✅ | ✅ | ❌ | ❌ |
+| Root via Magisk | ❌ | ❌ | ✅ | ✅ |
 
 This matters if you use banking apps, or anything else that checks bootloader
 state. Rooting needs an unlocked bootloader, and unlocking wipes the device.
