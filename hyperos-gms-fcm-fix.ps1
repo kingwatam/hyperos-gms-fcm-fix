@@ -46,6 +46,11 @@
 
     Findings: https://github.com/dingwen07/hyperos-fcm-fix
 
+.PARAMETER Menu
+    Interactive menu covering every action below. Each choice runs and then the
+    menu comes back, until you quit. Modifiers such as -Serial, -KeepShellWrite
+    and -AllowEmptyList can be passed alongside it and apply to the whole session.
+
 .PARAMETER Repair
     Put com.google.android.gms in both freeze exemption lists if it is missing,
     run "dumpsys greezer IM GMS disable" and "dumpsys greezer LM add", then send
@@ -110,12 +115,17 @@
     Repair GMS and exempt another app in one pass.
 
 .EXAMPLE
+    .\hyperos-gms-fcm-fix.ps1 -Menu
+    Pick actions from a menu instead of typing a switch each time.
+
+.EXAMPLE
     .\hyperos-gms-fcm-fix.ps1 -RemovePackage com.google.android.gms
     Undo the GMS entry.
 #>
 
 [CmdletBinding()]
 param(
+    [switch]$Menu,
     [switch]$Repair,
     [switch]$CheckFreeze,
     [string[]]$AddPackage,
@@ -180,12 +190,17 @@ if ($Serial) { $adbArgs = @("-s", $Serial) }
 # Out-String blob into Select-String misparses multi-line output: MatchInfo.Line
 # then reports the wrong text, which is how "mGmsLimitEnabled" once printed as
 # "Settings:".
-function Sh($cmd) { @(adb @adbArgs shell $cmd 2>$null) }
+#
+# The empty array on the left of the pipe is not decoration. Without it adb
+# inherits this script's stdin and swallows it, so the interactive menu loses
+# whatever the user typed. Confirmed: with a plain adb call, a piped answer to
+# Read-Host came back empty; with @() | adb it came back intact.
+function Sh($cmd) { @(@() | adb @adbArgs shell $cmd 2>$null) }
 function ShText($cmd) { ((Sh $cmd) -join "`n").Trim() }
 
 # greezer output is ~60 KB, which survives the pipe, but writing it to disk
 # keeps -CheckFreeze independent of console width and pipe buffering.
-function Sh-ToFile($cmd, $path) { adb @adbArgs shell $cmd > $path }
+function Sh-ToFile($cmd, $path) { @() | adb @adbArgs shell $cmd > $path }
 
 function Get-Setting($name) { ShText "settings --user $User get system $name" }
 
@@ -473,6 +488,208 @@ function Show-FreezeCheck {
     }
 }
 
+# Read-only report plus what to do next. Shared by the no-switch run and by the
+# menu, so both give the same advice.
+function Show-StatusAndNext {
+    Show-Status
+    Head "NEXT"
+    Note "Read-only run. Nothing was changed."
+    if ((Get-Entries) -notcontains $DefaultPkg) {
+        Note "To fix:  $self -Repair"
+    }
+}
+
+function Invoke-Watch([int]$Every = 5) {
+    Head "WATCH MODE - Ctrl+C to stop"
+    Note "Read-only. Needs the PC tethered, so this is a diagnostic aid rather"
+    Note "than a permanent fix. For continuous protection use a Shizuku app."
+    while ($true) {
+        Show-Status
+        Write-Host ("`n  -- {0} - Ctrl+C to stop" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+        Start-Sleep -Seconds $Every
+    }
+}
+
+# The write path, shared by the switches and the menu so both behave identically.
+# -Add and -Remove are package lists. -WithGameGate also touches the predownload
+# gate, which only a full repair does: -AddPackage deliberately covers the
+# no-restrictions list alone, because that key belongs to the game predownload
+# components. -IsUndo additionally returns the Greezer limiter to its factory
+# value, which -RemovePackage on its own does not.
+function Invoke-Write {
+    param(
+        [string[]]$Add    = @(),
+        [string[]]$Remove = @(),
+        [switch]$WithGameGate,
+        [switch]$IsUndo
+    )
+
+    Head "REPAIR"
+    if (-not (Enable-ShellWrite)) {
+        Bad "shell cannot write Settings.System even after appops and pm grant."
+        Note "Aborting. No changes were made."
+        exit 1
+    }
+    Ok "shell can write Settings.System"
+
+    $entries = Get-SafeEntries
+    Save-State $entries
+
+    foreach ($p in $Remove) {
+        if ($entries -contains $p) { $entries = $entries | Where-Object { $_ -ne $p }; Ok "removed $p" }
+        else { Note "$p not present" }
+    }
+    foreach ($p in $Add) {
+        if ($entries -notcontains $p) { $entries += $p; Ok "added $p" }
+        else { Note "$p already present" }
+    }
+
+    $entries = Set-Entries $entries
+    if (($Add | Where-Object { $entries -notcontains $_ }).Count -gt 0) {
+        Bad "write did not land for at least one package"
+    } else {
+        Ok "list written ($($entries.Count) entries)"
+        Save-State $entries
+    }
+
+    $game = Get-GameEntries
+    if ($Remove -contains $DefaultPkg) {
+        if ($game -contains $DefaultPkg) {
+            $game = Set-GameEntries @($game | Where-Object { $_ -ne $DefaultPkg })
+            Ok "Play services removed from $GameKey"
+        }
+    } elseif ($WithGameGate -and $game -notcontains $DefaultPkg) {
+        $game = Set-GameEntries ($game + $DefaultPkg)
+        if ($game -contains $DefaultPkg) { Ok "Play services added to $GameKey" }
+        else { Warn "write to $GameKey did not land (harmless, the list entry above still applies)" }
+    } elseif ($WithGameGate) {
+        Ok "Play services already in $GameKey"
+    }
+
+    # Volatile: resets on reboot. Greezer checks the list before this limiter acts,
+    # so the entries above are the part that matters.
+    $limiter = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
+        ForEach-Object { $_.ToString().Trim() }
+    if ($limiter -notmatch "false") {
+        Sh "dumpsys greezer IM GMS disable" | Out-Null
+        $now = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
+            ForEach-Object { $_.ToString().Trim() }
+        if ($now -match "false") { Ok "Greezer GMS limiter disabled" }
+        else { Warn "limiter not available on this build (harmless)" }
+    } else { Ok "Greezer GMS limiter already disabled" }
+
+    # Restores GMS to the ordinary Aurogon allowlist, which triggerGMSLimitAction
+    # removes it from. Does not cover PowerStrategyMode, so this is the third
+    # layer rather than a replacement for the list.
+    Sh "dumpsys greezer LM add $DefaultPkg" | Out-Null
+
+    foreach ($p in $Add) {
+        Send-Thaw $p
+        Send-Reconnect $p
+    }
+    if ($Add.Count) { Ok "thaw and reconnect broadcast sent" }
+
+    # An undo also has to put the Greezer limiter back, which a plain removal would
+    # leave disabled. That flag is the most intrusive thing a repair changes, so
+    # leaving it flipped after an undo would be the worst version of this bug. The
+    # "dumpsys greezer LM add" allowlist entry has no documented reverse verb and is
+    # runtime-only, so it clears on the next reboot and nothing more is attempted.
+    if ($IsUndo) {
+        Sh "dumpsys greezer IM GMS enable" | Out-Null
+        $back = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
+            ForEach-Object { $_.ToString().Trim() }
+        if ($back -notmatch "false") { Ok "Greezer GMS limiter returned to its factory value" }
+        else { Warn "could not re-enable the limiter; run 'dumpsys greezer IM GMS enable' by hand" }
+        Note "The Aurogon allowlist entry added by a repair has no reverse verb."
+        Note "It is runtime-only and clears on the next reboot."
+    }
+
+    Show-Status
+
+    if (-not $KeepShellWrite) {
+        Revoke-ShellWrite
+        if (Enable-ShellWrite) { Revoke-ShellWrite }   # confirm it stuck
+        Ok "shell WRITE_SETTINGS revoked again"
+    }
+
+    Head "RESULT"
+    if ($IsUndo) {
+        Ok "Repair undone."
+    } elseif ($WithGameGate) {
+        Ok "Repair applied."
+        Note "Lock the phone for 10 minutes, unlock, then run:"
+        Note "  $self -CheckFreeze"
+        Note ""
+        Note "PowerKeeper rebuilds the list from its own database and can drop these"
+        Note "entries again without warning. Re-run -Repair when notifications lag."
+    } else {
+        Ok "List updated."
+    }
+}
+
+# One menu, one action per choice, then straight back to it. The switches stay
+# working, so this is a convenience rather than the only route to any action.
+# An empty answer quits, which also stops a scripted run from looping forever.
+#
+# The screen is cleared on every pass except the first, so the menu lands at the
+# top of the window rather than below the last report, which on a tall phone
+# screen meant scrolling up to find it. The "Press Enter" pause before the clear
+# is what gives you a chance to read the result of the action you just ran.
+# The first pass keeps the DEVICE block, which says which phone it found.
+function Invoke-Menu {
+    $first = $true
+    while ($true) {
+        if (-not $first) { try { Clear-Host } catch { } }
+        $first = $false
+
+        Head "MENU"
+        Note "  1  Status report, changes nothing"
+        Note "  2  Repair, exempt Play services at both gates"
+        Note "  3  Check freeze events since boot"
+        Note "  4  Add a package to the no-restrictions list"
+        Note "  5  Remove a package from the no-restrictions list"
+        Note "  6  List packages you can add or remove"
+        Note "  7  Watch, repeat the status report"
+        Note "  8  Undo the repair"
+        Note "  q  Quit"
+
+        $choice = Read-Host "  Choose"
+        if (-not $choice) { return }
+        $choice = "$choice".Trim().ToLower()
+        if (-not $choice) { return }
+
+        switch ($choice) {
+            "1" { Show-StatusAndNext }
+            "2" { Invoke-Write -Add @($DefaultPkg) -WithGameGate }
+            "3" { Show-FreezeCheck }
+            "4" {
+                $pkg = Read-Host "  Package name to add"
+                if ($pkg -and $pkg.Trim()) { Invoke-Write -Add @($pkg.Trim()) }
+                else { Warn "nothing entered, nothing changed" }
+            }
+            "5" {
+                $pkg = Read-Host "  Package name to remove"
+                if ($pkg -and $pkg.Trim()) { Invoke-Write -Remove @($pkg.Trim()) }
+                else { Warn "nothing entered, nothing changed" }
+            }
+            "6" { Show-Candidates }
+            "7" {
+                $raw = Read-Host "  Seconds between reports (default $Seconds)"
+                $every = $Seconds
+                $parsed = 0
+                if ($raw -and [int]::TryParse($raw, [ref]$parsed) -and $parsed -gt 0) { $every = $parsed }
+                Invoke-Watch $every
+            }
+            "8" { Invoke-Write -Remove @($DefaultPkg) -IsUndo }
+            "q" { return }
+            default { Warn "no such choice: $choice" }
+        }
+
+        Write-Host ""
+        [void](Read-Host "  Press Enter for the menu")
+    }
+}
+
 # Preflight
 if (-not (Get-Command adb -ErrorAction SilentlyContinue)) {
     Bad "adb not found on PATH."
@@ -496,7 +713,7 @@ if ($attached.Count -gt 1 -and -not $Serial) {
     # Queried with an explicit -s per serial. Sh cannot be used here because
     # $adbArgs is still empty, which is the thing being resolved.
     $hwSerials = @($attached |
-        ForEach-Object { ((adb -s $_ shell getprop ro.serialno 2>$null) -join "").Trim() } |
+        ForEach-Object { ((@() | adb -s $_ shell getprop ro.serialno 2>$null) -join "").Trim() } |
         Where-Object { $_ -ne "" } |
         Select-Object -Unique)
     if ($hwSerials.Count -eq 1) {
@@ -528,19 +745,10 @@ Row "HyperOS"      (Sh "getprop ro.miui.ui.version.name")
 Row "Android"      "$(Sh 'getprop ro.build.version.release') (API $(Sh 'getprop ro.build.version.sdk'))"
 Row "profile"      "user $User (Greezer reads this one only)"
 
-if ($CheckFreeze) { Show-FreezeCheck; exit 0 }
+if ($Menu)           { Invoke-Menu; exit 0 }
+if ($CheckFreeze)    { Show-FreezeCheck; exit 0 }
 if ($ListCandidates) { Show-Candidates; exit 0 }
-
-if ($Watch) {
-    Head "WATCH MODE - Ctrl+C to stop"
-    Note "Read-only. Needs the PC tethered, so this is a diagnostic aid rather"
-    Note "than a permanent fix. For continuous protection use a Shizuku app."
-    while ($true) {
-        Show-Status
-        Write-Host ("`n  -- {0} - Ctrl+C to stop" -f (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
-        Start-Sleep -Seconds $Seconds
-    }
-}
+if ($Watch)          { Invoke-Watch $Seconds; exit 0 }
 
 $add = @()
 if ($Repair) { $add += $DefaultPkg }
@@ -549,111 +757,8 @@ $remove = PkgList $RemovePackage
 if ($Undo) { $remove += $DefaultPkg }
 
 if ($add.Count -eq 0 -and $remove.Count -eq 0) {
-    Show-Status
-    Head "NEXT"
-    Note "Read-only run. Pass -Repair, -AddPackage or -RemovePackage to write."
-    if ((Get-Entries) -notcontains $DefaultPkg) {
-        Note "To fix:  $self -Repair"
-    }
+    Show-StatusAndNext
     exit 0
 }
 
-Head "REPAIR"
-if (-not (Enable-ShellWrite)) {
-    Bad "shell cannot write Settings.System even after appops and pm grant."
-    Note "Aborting. No changes were made."
-    exit 1
-}
-Ok "shell can write Settings.System"
-
-$entries = Get-SafeEntries
-Save-State $entries
-
-foreach ($p in $remove) {
-    if ($entries -contains $p) { $entries = $entries | Where-Object { $_ -ne $p }; Ok "removed $p" }
-    else { Note "$p not present" }
-}
-foreach ($p in $add) {
-    if ($entries -notcontains $p) { $entries += $p; Ok "added $p" }
-    else { Note "$p already present" }
-}
-
-$entries = Set-Entries $entries
-if (($add | Where-Object { $entries -notcontains $_ }).Count -gt 0) {
-    Bad "write did not land for at least one package"
-} else {
-    Ok "list written ($($entries.Count) entries)"
-    Save-State $entries
-}
-
-# Second gate. Only Play services is managed here: the key belongs to the game
-# predownload components, which rewrite the whole string, so it is not a list to
-# add arbitrary packages to.
-$game = Get-GameEntries
-if ($remove -contains $DefaultPkg) {
-    if ($game -contains $DefaultPkg) {
-        $game = Set-GameEntries @($game | Where-Object { $_ -ne $DefaultPkg })
-        Ok "Play services removed from $GameKey"
-    }
-} elseif ($Repair -and $game -notcontains $DefaultPkg) {
-    $game = Set-GameEntries ($game + $DefaultPkg)
-    if ($game -contains $DefaultPkg) { Ok "Play services added to $GameKey" }
-    else { Warn "write to $GameKey did not land (harmless, the list entry above still applies)" }
-} elseif ($Repair) {
-    Ok "Play services already in $GameKey"
-}
-
-# Volatile: resets on reboot. Greezer checks the list before this limiter acts,
-# so the entries above are the part that matters.
-$limiter = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
-    ForEach-Object { $_.ToString().Trim() }
-if ($limiter -notmatch "false") {
-    Sh "dumpsys greezer IM GMS disable" | Out-Null
-    $now = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
-        ForEach-Object { $_.ToString().Trim() }
-    if ($now -match "false") { Ok "Greezer GMS limiter disabled" }
-    else { Warn "limiter not available on this build (harmless)" }
-} else { Ok "Greezer GMS limiter already disabled" }
-
-# Restores GMS to the ordinary Aurogon allowlist, which triggerGMSLimitAction
-# removes it from. Does not cover PowerStrategyMode, so this is the third
-# layer rather than a replacement for the list.
-Sh "dumpsys greezer LM add $DefaultPkg" | Out-Null
-
-foreach ($p in $add) {
-    Send-Thaw $p
-    Send-Reconnect $p
-}
-if ($add.Count) { Ok "thaw and reconnect broadcast sent" }
-
-# -Undo also has to put the Greezer limiter back, which -RemovePackage on its own
-# would leave disabled. That flag is the most intrusive thing -Repair changes,
-# so leaving it flipped after an undo would be the worst version of this bug.
-# The "dumpsys greezer LM add" allowlist entry has no documented reverse verb
-# and is runtime-only, so it clears on the next reboot and nothing more is
-# attempted here.
-if ($Undo) {
-    Sh "dumpsys greezer IM GMS enable" | Out-Null
-    $back = Sh "dumpsys greezer" | Select-String "mGmsLimitEnabled" |
-        ForEach-Object { $_.ToString().Trim() }
-    if ($back -notmatch "false") { Ok "Greezer GMS limiter returned to its factory value" }
-    else { Warn "could not re-enable the limiter; run 'dumpsys greezer IM GMS enable' by hand" }
-    Note "The Aurogon allowlist entry added by a repair has no reverse verb."
-    Note "It is runtime-only and clears on the next reboot."
-}
-
-Show-Status
-
-if (-not $KeepShellWrite) {
-    Revoke-ShellWrite
-    if (Enable-ShellWrite) { Revoke-ShellWrite }   # confirm it stuck
-    Ok "shell WRITE_SETTINGS revoked again"
-}
-
-Head "RESULT"
-Ok "Repair applied."
-Note "Lock the phone for 10 minutes, unlock, then run:"
-Note "  $self -CheckFreeze"
-Note ""
-Note "PowerKeeper rebuilds the list from its own database and can drop these"
-Note "entries again without warning. Re-run -Repair when notifications lag."
+Invoke-Write -Add $add -Remove $remove -WithGameGate:$Repair -IsUndo:$Undo

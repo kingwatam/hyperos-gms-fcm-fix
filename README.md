@@ -135,6 +135,7 @@ phone, screen-on is thawing Play services as it always did.
 - sends a thaw and a reconnect broadcast, since restoring an exemption does not
   unfreeze a process that is already frozen
 - applies the `MILLET_NO_RESTRICT_APP` exemption to any other package you name
+- offers every action from one menu, if you would rather not remember switches
 - read-only by default
 
 ## Quick start
@@ -155,36 +156,22 @@ git clone https://github.com/kingwatam/hyperos-gms-fcm-fix
 cd hyperos-gms-fcm-fix
 ```
 
-Run it with no arguments for a status report:
+Then open the menu and pick what you want. Every action is in it, each one runs
+and the menu comes straight back, so you can repair, check and repair again
+without retyping anything:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1
+powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Menu
 ```
 
-To apply the repair:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Repair
-```
-
-Then lock the phone for about ten minutes, unlock, and check whether Play
-services froze while it was off:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -CheckFreeze
-```
-
-To reverse a repair, including the Greezer limiter flag that `-Repair` changes:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Undo
-```
+See [Examples](#examples) for the same actions as single commands.
 
 ## Options
 
 | Switch | Effect |
 |---|---|
 | *(none)* | Status report. Writes nothing. |
+| `-Menu` | Pick actions from a menu, one at a time, until you quit |
 | `-Repair` | Exempt Play services at both gates, disable the Greezer GMS limiter, send a thaw |
 | `-CheckFreeze` | Count Play services freeze events since boot |
 | `-AddPackage <pkg>` | Add other packages to `MILLET_NO_RESTRICT_APP` |
@@ -197,10 +184,36 @@ powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Undo
 | `-Undo` | Reverse a repair, including the Greezer limiter flag |
 | `-Help` | Full parameter reference |
 
-`-Repair` and `-AddPackage` can be combined in one pass:
+Worked examples of each are in [Examples](#examples).
+
+## Examples
+
+The same actions the menu offers, as one command each. Every switch here maps to
+exactly one menu entry and does exactly the same thing.
+
+A status report, which writes nothing:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Repair -AddPackage com.whatsapp
+powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1
+```
+
+Apply the repair:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Repair
+```
+
+Lock the phone for about ten minutes, unlock, then check whether Play services
+froze while it was off:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -CheckFreeze
+```
+
+Reverse a repair, including the Greezer limiter flag that `-Repair` changes:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Undo
 ```
 
 To see what you can add, list the installed third-party packages and which of
@@ -208,6 +221,18 @@ them are already in the list:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -ListCandidates
+```
+
+Exempt another app in the same pass as a repair:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Repair -AddPackage com.whatsapp
+```
+
+Watch the state until interrupted, every 10 seconds:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\hyperos-gms-fcm-fix.ps1 -Watch -Seconds 10
 ```
 
 ## How it works
